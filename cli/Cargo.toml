@@ -1,0 +1,20 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ssv_contract = { path = "../ssv_contract" }
+storage = { path = "../storage" }
+env_logger = "0.9.0"
+tokio = "1.21.2"
+log = "0.4.17"
+ethers-core = "0.17.0"
+ethers-providers = "0.17.0"
+serde = "1.0.145"
+serde_json = "1.0.85"
+tungstenite = "0.17.3"
+url = "2.3.1"
+

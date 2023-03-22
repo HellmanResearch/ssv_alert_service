@@ -1,0 +1,36 @@
+// @generated automatically by Diesel CLI.
+
+diesel::table! {
+    account (public_key) {
+        public_key -> Varchar,
+        ssv_balance_human -> Float,
+    }
+}
+
+diesel::table! {
+    operator (id) {
+        id -> Unsigned<Integer>,
+        name -> Varchar,
+        account_public_key -> Varchar,
+        status -> Varchar,
+        validator_count -> Unsigned<Integer>,
+        fee_human -> Nullable<Float>,
+    }
+}
+
+diesel::table! {
+    posts (id) {
+        id -> Integer,
+        title -> Varchar,
+        body -> Text,
+        published -> Bool,
+    }
+}
+
+diesel::joinable!(operator -> account (account_public_key));
+
+diesel::allow_tables_to_appear_in_same_query!(
+    account,
+    operator,
+    posts,
+);

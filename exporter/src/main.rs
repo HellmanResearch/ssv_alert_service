@@ -1,0 +1,314 @@
+use std::fmt::format;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use actix_web::{web, App, HttpResponse, HttpServer, Responder, Result, http};
+use actix_web::guard::Guard;
+use prometheus_client::encoding::text::{encode, Encode};
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::registry::Registry;
+use storage::{MysqlStorage, Storage};
+use storage::operator::Status;
+use storage::account::Account;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicU32;
+// use log::LevelFilter::Info;
+use tracing_subscriber;
+use http::StatusCode;
+
+use env_logger;
+use log::{debug, error, info, log, warn};
+use serde::Deserialize;
+use clap::Parser;
+use std::fs;
+use toml;
+
+
+#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+pub enum Method {
+    Get,
+    Post,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+pub struct MethodLabels {
+    pub method: Method,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+pub struct BalanceLabels {
+    pub address: String,
+}
+
+
+#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+pub struct AccountLabels {
+    pub address: String,
+}
+
+
+#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+pub struct OperatorLabels {
+    pub id: u32,
+}
+
+pub struct Metrics {
+    account_balance: Family<AccountLabels, Gauge::<f64, AtomicU64>>,
+    operator_performance: Family<OperatorLabels, Gauge>,
+    operator_status: Family<OperatorLabels, Gauge>,
+    operator_fee: Family<OperatorLabels, Gauge::<f64, AtomicU64>>,
+    account_is_liquidated: Family<AccountLabels, Gauge>,
+}
+
+impl Metrics {
+    pub fn inc_requests(&self, method: Method) {
+        // self.requests.get_or_create(&MethodLabels { method }).inc();
+        // self.requests_2.get_or_create(&BalanceLabels{address: "0x0001".to_string()}).set(33);
+        // self.requests_2.get_or_create(&BalanceLabels{address: "0x0002".to_string()}).set(44);
+        // self.requests_2.get_or_create(&BalanceLabels{address: "0x0003".to_string()}).set(55);
+    }
+
+    pub fn set_operator_performance(&self, operator_id: u32, performance: f32) {
+        let performance_u64 = performance as u64;
+        let operator_labels = OperatorLabels { id: operator_id };
+        self.operator_performance.get_or_create(&operator_labels).set(performance_u64);
+    }
+
+    pub fn set_account_balance(&self, address: String, balance: f32) {
+        // let balance_u64 = balance as u64;
+        self.account_balance.get_or_create(&AccountLabels { address }).set(balance as f64);
+    }
+
+    pub fn set_account_is_liquidated(&self, address: String, is_liquidated: bool) {
+        let mut is_liquidated_u64 = 0;
+        if is_liquidated == true {
+            is_liquidated_u64 = 1;
+        }
+        self.account_is_liquidated.get_or_create(&AccountLabels { address }).set(is_liquidated_u64);
+    }
+
+    pub fn set_operator_status(&self, operator_id: u32, status: u32) {
+        let status_u64 = status as u64;
+        let operator_labels = OperatorLabels { id: operator_id };
+        self.operator_status.get_or_create(&operator_labels).set(status_u64);
+    }
+
+    pub fn set_operator_fee(&self, operator_id: u32, fee: f32) {
+        let fee_f64 = fee as f64;
+        let operator_labels = OperatorLabels { id: operator_id };
+        self.operator_fee.get_or_create(&operator_labels).set(fee_f64);
+    }
+}
+
+pub struct AppState {
+    pub registry: Registry,
+}
+
+pub async fn metrics_handler(state: web::Data<Mutex<AppState>>) -> Result<HttpResponse> {
+    let state = state.lock().unwrap();
+    let mut buf = Vec::new();
+    encode(&mut buf, &state.registry)?;
+    let body = std::str::from_utf8(buf.as_slice()).unwrap().to_string();
+    Ok(HttpResponse::Ok()
+        .content_type("application/openmetrics-text; version=1.0.0; charset=utf-8")
+        .body(body))
+}
+
+pub async fn update_handler(metrics: web::Data<Metrics>, config: web::Data<Config>) -> impl Responder {
+    let connect_url = config.database.connect_url.clone();
+    update_account(metrics.clone(), connect_url.clone());
+    update_operator(metrics, connect_url);
+    return "okay".to_string();
+}
+
+
+pub async fn ping_handler(metrics: web::Data<Metrics>, config: web::Data<Config>) -> impl Responder {
+    return "okay".to_string();
+}
+
+pub fn update_account(metrics: web::Data<Metrics>, storage_connect_url: String) {
+    let storage = MysqlStorage::new(storage_connect_url);
+    match storage.get_all_accounts() {
+        Ok(accounts) => {
+            info!("number of accounts: {}", accounts.len());
+            for account in accounts {
+                metrics.set_account_balance(account.public_key.clone(), account.ssv_balance_human);
+                metrics.set_account_is_liquidated(account.public_key, account.is_liquidation);
+            }
+        }
+        Err(error_info) => {}
+    }
+}
+
+
+pub fn update_operator(metrics: web::Data<Metrics>, storage_connect_url: String) {
+    let storage = MysqlStorage::new(storage_connect_url);
+    match storage.get_all_operators() {
+        Ok(operators) => {
+            info!("number of operators: {}", operators.len());
+            for operator in operators {
+                metrics.set_operator_performance(operator.id, operator.performance_1day);
+                metrics.set_operator_fee(operator.id, operator.fee_human);
+                if operator.status == "active" {
+                    metrics.set_operator_status(operator.id, 0);
+                } else if operator.status == "inactive" {
+                    metrics.set_operator_status(operator.id, 1);
+                } else if operator.status == "removed" {
+                    metrics.set_operator_status(operator.id, 2);
+                } else {
+                    error!("unknown status: {}", operator.status)
+                }
+            }
+        }
+        Err(error_info) => {}
+    }
+}
+
+
+pub fn update(metrics: web::Data<Metrics>, storage_connect_url: String) {
+    // let storage = MysqlStorage::new(storage_connect_url);
+    // println!("la")
+    update_account(metrics, storage_connect_url);
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ConfigDatabase {
+    connect_url: String,
+}
+
+
+#[derive(Clone, Deserialize)]
+pub struct ConfigExporter {
+    port: u16,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ConfigEth {
+    eth1_http_endpoint: String,
+    eth1_ws_endpoint: String,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ConfigSSV {
+    contract_abi: String,
+    contract_address: String,
+    explorer_ws_endpoint: String,
+    start_block_sync: u64,
+}
+
+
+#[derive(Clone, Deserialize)]
+pub struct Config {
+    database: ConfigDatabase,
+    ssv: ConfigSSV,
+    eth: ConfigEth,
+    exporter: ConfigExporter,
+}
+
+#[derive(Parser)]
+struct Args {
+    #[arg(short, long)]
+    config: String,
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    env_logger::builder().filter_level(log::LevelFilter::Info).init();
+
+    info!("starting");
+
+    let args: Args = Args::parse();
+    let config_content = fs::read_to_string(args.config.clone()).expect(format!("Unable to read file {}", args.config).as_str());
+    let config: Config = toml::from_str(config_content.as_str()).unwrap();
+
+    // let connect_url = "mysql://root:wonders,1@192.168.1.128:3308/ssv_alert_service_5".to_string();
+    // const port: u16 = 9016;
+
+    let metrics = web::Data::new(Metrics {
+        account_balance: Family::default(),
+        operator_performance: Family::default(),
+        operator_status: Family::default(),
+        operator_fee: Family::default(),
+        account_is_liquidated: Family::default(),
+    });
+
+    let config = web::Data::new(config);
+
+    let mut state = AppState {
+        registry: Registry::default(),
+    };
+
+    state.registry.register(
+        "account_balance",
+        "balance of account",
+        Box::new(metrics.account_balance.clone()),
+    );
+
+    state.registry.register(
+        "operator_status",
+        "status of operator",
+        Box::new(metrics.operator_status.clone()),
+    );
+
+    state.registry.register(
+        "operator_performance",
+        "performance of operator",
+        Box::new(metrics.operator_performance.clone()),
+    );
+
+    state.registry.register(
+        "operator_fee",
+        "fee of operator",
+        Box::new(metrics.operator_fee.clone()),
+    );
+
+    state.registry.register(
+        "account_is_liquidated",
+        "account is liquidated",
+        Box::new(metrics.account_is_liquidated.clone()),
+    );
+
+    let state = web::Data::new(Mutex::new(state));
+    // let state = web::Data::new(Mutex::new(state));
+
+    let port = config.exporter.port;
+    tokio::spawn(async move {
+        loop {
+            let url = format!("http://localhost:{}/update", port);
+            match reqwest::get(url).await {
+                Ok(response) => {
+                    let status_code = response.status();
+                    let body = response.text().await.unwrap();
+                    if status_code == 200 {
+                        info!("successful request update response body: {}", body);
+                    } else {
+                        error!("response status is not 200 status_code: {}, body: {}", status_code, body);
+                    }
+                }
+                Err(error) => {
+                    error!("failed request update error: {}", error);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(60 * 3)).await;
+        }
+    });
+
+    let server_config = config.clone();
+
+    info!("listening port: {}", config.exporter.port);
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(metrics.clone())
+            .app_data(state.clone())
+            .app_data(server_config.clone())
+            .service(web::resource("/metrics").route(web::get().to(metrics_handler)))
+            .service(web::resource("/update").route(web::get().to(update_handler)))
+            .service(web::resource("/ping").route(web::get().to(update_handler)))
+    })
+        .bind(("0.0.0.0", config.exporter.port))?
+        .run()
+        .await
+}
